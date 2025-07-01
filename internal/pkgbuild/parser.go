@@ -19,6 +19,8 @@ type Package struct {
 	SourceRepository string // Derived from URL or source fields
 	RawName          string // Original name before cleanup
 	Variables        map[string]string // Variables defined in the PKGBUILD
+	HasPkgverFunc    bool   // Whether the PKGBUILD contains a pkgver() function
+	PkgverFunc       string // The content of the pkgver() function
 }
 
 // Parse reads a PKGBUILD file and extracts relevant information
@@ -36,12 +38,42 @@ func Parse(pkgbuildPath string) (*Package, error) {
 	inMultiLine := false
 	currentVar := ""
 	multiLineBuffer := ""
+	inPkgverFunc := false
+	pkgverFuncBuffer := ""
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
 		originalLine := line
 		line = strings.TrimSpace(line)
+
+		// Handle pkgver() function detection
+		if inPkgverFunc {
+			pkgverFuncBuffer += originalLine + "\n"
+			if line == "}" {
+				inPkgverFunc = false
+				pkg.PkgverFunc = pkgverFuncBuffer
+			}
+			continue
+		}
+
+		// Check for start of pkgver() function
+		if strings.HasPrefix(line, "pkgver()") && strings.Contains(line, "{") {
+			inPkgverFunc = true
+			pkg.HasPkgverFunc = true
+			pkgverFuncBuffer = originalLine + "\n"
+			if line == "pkgver() {" || strings.HasSuffix(line, " {") {
+				// Function continues on next lines
+				continue
+			} else {
+				// Single-line function (unlikely but possible)
+				if strings.HasSuffix(line, "}") {
+					inPkgverFunc = false
+					pkg.PkgverFunc = pkgverFuncBuffer
+				}
+				continue
+			}
+		}
 
 		// Skip comments and empty lines
 		if line == "" || strings.HasPrefix(line, "#") {

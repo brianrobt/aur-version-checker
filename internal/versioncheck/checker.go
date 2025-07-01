@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -430,6 +432,102 @@ func CheckVersion(pkg *pkgbuild.Package) (VersionInfo, error) {
 	}
 }
 
+// executePkgverFunction executes the pkgver() function from a PKGBUILD to get the latest version
+func executePkgverFunction(pkg *pkgbuild.Package, repoURL string) (string, error) {
+	if !pkg.HasPkgverFunc || pkg.PkgverFunc == "" {
+		return "", errors.New("no pkgver() function found")
+	}
+
+	// Create a temporary directory
+	tmpDir, err := os.MkdirTemp("", "aur-version-check-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp directory: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Clone the repository
+	gitURL := repoURL
+	if !strings.HasSuffix(gitURL, ".git") {
+		gitURL += ".git"
+	}
+
+	// Try different clone URLs if the first one fails
+	cloneURLs := []string{
+		gitURL,
+	}
+	
+	// If the URL doesn't start with http/https, assume it's a GitHub repo
+	if !strings.HasPrefix(gitURL, "http") {
+		cloneURLs = append(cloneURLs, "https://github.com/"+gitURL)
+	}
+
+	var cloneDir string
+	var cloneErr error
+	for _, url := range cloneURLs {
+		cloneDir = filepath.Join(tmpDir, "repo")
+		cmd := exec.Command("git", "clone", "--depth", "1", url, cloneDir)
+		cloneErr = cmd.Run()
+		if cloneErr == nil {
+			break
+		}
+	}
+
+	if cloneErr != nil {
+		return "", fmt.Errorf("failed to clone repository: %w", cloneErr)
+	}
+
+	// Create a temporary script that sets up the environment and executes pkgver()
+	scriptPath := filepath.Join(tmpDir, "pkgver_script.sh")
+	scriptContent := fmt.Sprintf(`#!/bin/bash
+set -e
+cd "%s"
+
+# Source the variables from the original PKGBUILD
+%s
+
+# Define common variables that might be used in pkgver()
+srcdir="%s"
+pkgdir=""
+
+# Execute the pkgver function
+%s
+`, cloneDir, generateVariableExports(pkg.Variables), cloneDir, pkg.PkgverFunc)
+
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		return "", fmt.Errorf("failed to create pkgver script: %w", err)
+	}
+
+	// Execute the script
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Dir = cloneDir
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to execute pkgver function: %w", err)
+	}
+
+	version := strings.TrimSpace(string(output))
+	if version == "" {
+		return "", errors.New("pkgver function returned empty version")
+	}
+
+	return version, nil
+}
+
+// generateVariableExports creates bash export statements for PKGBUILD variables
+func generateVariableExports(variables map[string]string) string {
+	var exports []string
+	for key, value := range variables {
+		// Skip certain variables that shouldn't be exported or might cause issues
+		if key == "source" || key == "pkgver" || key == "pkgrel" || strings.HasPrefix(key, "_") {
+			continue
+		}
+		// Properly quote the value to handle special characters
+		quotedValue := fmt.Sprintf("'%s'", strings.ReplaceAll(value, "'", "'\"'\"'"))
+		exports = append(exports, fmt.Sprintf("export %s=%s", key, quotedValue))
+	}
+	return strings.Join(exports, "\n")
+}
+
 func checkGitHubVersion(pkg *pkgbuild.Package, owner, repo string) (VersionInfo, error) {
 	info := VersionInfo{
 		PackageName:  pkg.Name,
@@ -438,24 +536,34 @@ func checkGitHubVersion(pkg *pkgbuild.Package, owner, repo string) (VersionInfo,
 	
 	info.UpstreamURL = fmt.Sprintf("https://github.com/%s/%s", owner, repo)
 
-	// If this is a -git package, check commits instead of releases/tags
+	// If this is a -git package, use pkgver() function if available
 	if strings.HasSuffix(pkg.RawName, "-git") {
-		commit, branch, err := getGitHubLatestCommit(owner, repo)
-		if err != nil {
-			info.Error = fmt.Errorf("failed to get GitHub commit: %w", err)
-			return info, info.Error
-		}
-		info.UpstreamVersion = fmt.Sprintf("%s-%s", branch, commit[:7])
-		
-		// Compare with local version (if it's a git format like r191.d46ed5e)
-		gitVersionPattern := regexp.MustCompile(`^r\d+\.([a-f0-9]+)$`)
-		if match := gitVersionPattern.FindStringSubmatch(pkg.Version); len(match) > 1 {
-			// Different commit hashes mean an update is needed
-			info.NeedsUpdate = match[1] != commit[:7]
+		if pkg.HasPkgverFunc {
+			// Use the pkgver() function to get the latest version
+			upstreamVersion, err := executePkgverFunction(pkg, info.UpstreamURL)
+			if err != nil {
+				// Fall back to commit-based checking if pkgver() fails
+				commit, branch, err := getGitHubLatestCommit(owner, repo)
+				if err != nil {
+					info.Error = fmt.Errorf("failed to execute pkgver() and get GitHub commit: %w", err)
+					return info, info.Error
+				}
+				info.UpstreamVersion = fmt.Sprintf("%s-%s", branch, commit[:7])
+			} else {
+				info.UpstreamVersion = upstreamVersion
+			}
 		} else {
-			// If local version is not in git format, always mark as needing update
-			info.NeedsUpdate = true
+			// Fall back to old commit-based checking
+			commit, branch, err := getGitHubLatestCommit(owner, repo)
+			if err != nil {
+				info.Error = fmt.Errorf("failed to get GitHub commit: %w", err)
+				return info, info.Error
+			}
+			info.UpstreamVersion = fmt.Sprintf("%s-%s", branch, commit[:7])
 		}
+		
+		// Compare versions
+		info.NeedsUpdate = info.UpstreamVersion != pkg.Version
 		
 		return info, nil
 	}
@@ -724,7 +832,37 @@ func checkGitLabVersion(pkg *pkgbuild.Package, owner, repo string) (VersionInfo,
 	
 	info.UpstreamURL = fmt.Sprintf("https://gitlab.com/%s/%s", owner, repo)
 
-	// First try releases
+	// If this is a -git package, use pkgver() function if available
+	if strings.HasSuffix(pkg.RawName, "-git") {
+		if pkg.HasPkgverFunc {
+			// Use the pkgver() function to get the latest version
+			upstreamVersion, err := executePkgverFunction(pkg, info.UpstreamURL)
+			if err != nil {
+				info.Error = fmt.Errorf("failed to execute pkgver() for GitLab package: %w", err)
+				return info, info.Error
+			}
+			info.UpstreamVersion = upstreamVersion
+		} else {
+			// For GitLab -git packages without pkgver(), we can't easily get commit info
+			// So we'll just use tags/releases as a fallback
+			version, err := getGitLabLatestRelease(owner, repo)
+			if err != nil {
+				var tagErr error
+				version, tagErr = getGitLabTags(owner, repo)
+				if tagErr != nil {
+					info.Error = fmt.Errorf("failed to get GitLab version: %w", err)
+					return info, info.Error
+				}
+			}
+			info.UpstreamVersion = version
+		}
+		
+		// Compare versions
+		info.NeedsUpdate = info.UpstreamVersion != pkg.Version
+		return info, nil
+	}
+
+	// For normal packages, first try releases
 	version, err := getGitLabLatestRelease(owner, repo)
 	
 	// If that fails, try tags
